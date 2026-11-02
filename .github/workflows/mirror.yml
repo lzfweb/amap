@@ -1,0 +1,413 @@
+# ==============================================================================
+# 通用「上游镜像同步」工作流（GitHub Repo Mirror）
+#
+# 放到任意仓库的 .github/workflows/mirror.yml 即可使用，三种配置方式任选其一：
+#   A. 改文件：把下面 CFG_UPSTREAM 改成上游 owner/repo，提交即可（最省事）
+#   B. 不改文件：Settings → Secrets and variables → Actions → Variables
+#      新建 MIRROR_UPSTREAM = owner/repo（变量优先级高于文件里的默认值）
+#   C. 零配置：本仓库若是 Fork 出来的，CFG_UPSTREAM 留空 → 自动取父仓库
+#
+# 自动同步开关（CFG_AUTO_SYNC / 变量 MIRROR_AUTO_SYNC）：
+#   true  → 按 on.schedule 的 cron 定时自动同步
+#   false → 只在 Actions 页面手动点「Run workflow」时同步
+#
+# 同步的仓库、分支、Tags、Releases、保留文件 全部是配置项，见下方 env 区。
+# ==============================================================================
+name: 同步上游镜像
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 强制同步（跳过“已是最新”判断，直接 force push）
+        type: boolean
+        default: false
+      sync_tags:
+        description: 同步 Tags
+        type: boolean
+        default: true
+      sync_releases:
+        description: 同步 Releases
+        type: boolean
+        default: true
+      dry_run:
+        description: 演练模式（只打印计划，不推送、不写 Release）
+        type: boolean
+        default: false
+  schedule:
+    # 定时同步频率：UTC 18:23 = 北京时间 02:23（避开整点高峰）
+    # 不想定时就跑，把这里注释掉，或用开关 MIRROR_AUTO_SYNC=false 关闭
+    - cron: "23 18 * * *"
+
+concurrency:
+  group: mirror-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # ============================ 配置区（只改这里） ============================
+  # 上游仓库，格式 owner/repo；留空 = 自动识别 Fork 的父仓库
+  CFG_UPSTREAM: "GroverLau/amap"
+  # 要同步的分支；留空 = 跟随上游默认分支（main / master 自动识别）
+  CFG_BRANCH: ""
+  # 定时自动同步总开关
+  CFG_AUTO_SYNC: "true"
+  # 是否同步 Tags / Releases
+  CFG_SYNC_TAGS: "true"
+  CFG_SYNC_RELEASES: "true"
+  # 是否删除本仓库中「上游已不存在」的 Tag（谨慎开启，会删 Tag）
+  CFG_PRUNE_TAGS: "false"
+  # 同步后保留、不被上游覆盖的路径（空格分隔，可写文件或目录）
+  # 当前工作流文件会自动加入，无需手写
+  CFG_PRESERVE: ""
+  # =========================================================================
+
+jobs:
+  mirror:
+    name: 镜像同步
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # ---------------------------------------------------------------- 解析配置
+      - name: 解析配置
+        id: cfg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN_FORCE: ${{ github.event.inputs.force }}
+          IN_SYNC_TAGS: ${{ github.event.inputs.sync_tags }}
+          IN_SYNC_RELEASES: ${{ github.event.inputs.sync_releases }}
+          IN_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          VAR_UPSTREAM: ${{ vars.MIRROR_UPSTREAM }}
+          VAR_BRANCH: ${{ vars.MIRROR_BRANCH }}
+          VAR_AUTO_SYNC: ${{ vars.MIRROR_AUTO_SYNC }}
+          VAR_SYNC_TAGS: ${{ vars.MIRROR_SYNC_TAGS }}
+          VAR_SYNC_RELEASES: ${{ vars.MIRROR_SYNC_RELEASES }}
+          VAR_PRUNE_TAGS: ${{ vars.MIRROR_PRUNE_TAGS }}
+          VAR_PRESERVE: ${{ vars.MIRROR_PRESERVE }}
+        run: |
+          set -euo pipefail
+
+          pick()    { if [ -n "${1:-}" ]; then printf '%s' "$1"; else printf '%s' "${2:-}"; fi; }
+          lower()   { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'; }
+          is_true() { case "$(lower "$1")" in true|1|yes|on) return 0;; *) return 1;; esac; }
+
+          # 仓库 Variables 优先，其次用文件里的默认值
+          UPSTREAM=$(pick "$VAR_UPSTREAM" "$CFG_UPSTREAM")
+          BRANCH=$(pick "$VAR_BRANCH" "$CFG_BRANCH")
+          AUTO_SYNC=$(pick "$VAR_AUTO_SYNC" "$CFG_AUTO_SYNC")
+          SYNC_TAGS=$(pick "$VAR_SYNC_TAGS" "$CFG_SYNC_TAGS")
+          SYNC_RELEASES=$(pick "$VAR_SYNC_RELEASES" "$CFG_SYNC_RELEASES")
+          PRUNE_TAGS=$(pick "$VAR_PRUNE_TAGS" "$CFG_PRUNE_TAGS")
+          PRESERVE=$(pick "$VAR_PRESERVE" "$CFG_PRESERVE")
+
+          # 手动触发时，表单值覆盖配置
+          FORCE=false
+          DRY_RUN=false
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ -n "${IN_SYNC_TAGS:-}" ]; then SYNC_TAGS="${IN_SYNC_TAGS}"; fi
+            if [ -n "${IN_SYNC_RELEASES:-}" ]; then SYNC_RELEASES="${IN_SYNC_RELEASES}"; fi
+            if [ -n "${IN_FORCE:-}" ]; then FORCE="${IN_FORCE}"; fi
+            if [ -n "${IN_DRY_RUN:-}" ]; then DRY_RUN="${IN_DRY_RUN}"; fi
+          fi
+
+          # 上游为空 → 尝试从 Fork 父仓库自动识别
+          if [ -z "$UPSTREAM" ]; then
+            UPSTREAM=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty' 2>/dev/null || true)
+            if [ -n "$UPSTREAM" ]; then echo "自动识别上游：${UPSTREAM}（Fork 父仓库）"; fi
+          fi
+          if [ -z "$UPSTREAM" ]; then
+            echo "::error::未配置上游仓库：请设置 CFG_UPSTREAM 或仓库变量 MIRROR_UPSTREAM（owner/repo）"
+            exit 1
+          fi
+          # 容错：允许直接粘贴仓库 URL
+          UPSTREAM=$(printf '%s' "$UPSTREAM" | sed -e 's#^https\?://github.com/##' -e 's#\.git$##' -e 's#/$##')
+          if [ "$(lower "$UPSTREAM")" = "$(lower "$GITHUB_REPOSITORY")" ]; then
+            echo "::error::上游仓库不能是当前仓库自己（$UPSTREAM）"
+            exit 1
+          fi
+          if ! gh repo view "$UPSTREAM" --json name > /dev/null 2>&1; then
+            echo "::error::无法访问上游仓库 $UPSTREAM，请确认仓库存在且为公开仓库"
+            exit 1
+          fi
+          if [ -z "$BRANCH" ]; then
+            BRANCH=$(gh api "repos/${UPSTREAM}" --jq '.default_branch')
+          fi
+
+          # 是否需要执行：手动触发总是执行，定时触发看总开关
+          SHOULD_RUN=true
+          if [ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]; then
+            if is_true "$AUTO_SYNC"; then SHOULD_RUN=true; else SHOULD_RUN=false; fi
+          fi
+
+          # 当前工作流文件路径必须保留，否则下一次同步会被上游覆盖/删除
+          WF_PATH="${GITHUB_WORKFLOW_REF%@*}"
+          WF_PATH="${WF_PATH#${GITHUB_REPOSITORY}/}"
+          if [ -n "$WF_PATH" ]; then
+            case " ${PRESERVE} " in
+              *" ${WF_PATH} "*) ;;
+              *) PRESERVE="${WF_PATH} ${PRESERVE}" ;;
+            esac
+          fi
+
+          DEFAULT_BRANCH=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch' 2>/dev/null || true)
+
+          echo "上游仓库    : ${UPSTREAM}"
+          echo "同步分支    : ${BRANCH}"
+          echo "自动同步    : ${AUTO_SYNC}"
+          echo "同步Tags    : ${SYNC_TAGS}"
+          echo "同步Releases: ${SYNC_RELEASES}"
+          echo "清理Tag     : ${PRUNE_TAGS}"
+          echo "保留路径    : ${PRESERVE}"
+          echo "本次执行    : ${SHOULD_RUN}（事件 ${GITHUB_EVENT_NAME}）"
+
+          if [ -n "$DEFAULT_BRANCH" ] && [ "$DEFAULT_BRANCH" != "$BRANCH" ]; then
+            echo "::warning::本仓库默认分支是 ${DEFAULT_BRANCH}，而同步分支是 ${BRANCH}；建议把默认分支改成 ${BRANCH}，否则首页显示的是旧内容。"
+          fi
+
+          {
+            echo "### 镜像同步配置"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 上游 | \`${UPSTREAM}\` |"
+            echo "| 分支 | \`${BRANCH}\` |"
+            echo "| 自动同步 | \`${AUTO_SYNC}\` |"
+            echo "| 同步 Tags | \`${SYNC_TAGS}\` |"
+            echo "| 同步 Releases | \`${SYNC_RELEASES}\` |"
+            echo "| 清理多余 Tag | \`${PRUNE_TAGS}\` |"
+            echo "| 保留路径 | \`${PRESERVE}\` |"
+            echo "| 本次执行 | \`${SHOULD_RUN}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$SHOULD_RUN" != "true" ]; then
+            echo "::notice::自动同步已关闭（MIRROR_AUTO_SYNC=${AUTO_SYNC}），本次跳过。"
+          fi
+
+          {
+            echo "upstream=${UPSTREAM}"
+            echo "branch=${BRANCH}"
+            echo "preserve=${PRESERVE}"
+            echo "sync_tags=${SYNC_TAGS}"
+            echo "sync_releases=${SYNC_RELEASES}"
+            echo "prune_tags=${PRUNE_TAGS}"
+            echo "force=${FORCE}"
+            echo "dry_run=${DRY_RUN}"
+            echo "run=${SHOULD_RUN}"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------- 同步分支与 Tags
+      - name: 检出代码
+        if: steps.cfg.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: 同步代码与 Tags
+        if: steps.cfg.outputs.run == 'true'
+        id: code
+        env:
+          UPSTREAM_REPO: ${{ steps.cfg.outputs.upstream }}
+          BRANCH: ${{ steps.cfg.outputs.branch }}
+          PRESERVE_PATHS: ${{ steps.cfg.outputs.preserve }}
+          SYNC_TAGS: ${{ steps.cfg.outputs.sync_tags }}
+          PRUNE_TAGS: ${{ steps.cfg.outputs.prune_tags }}
+          FORCE: ${{ steps.cfg.outputs.force }}
+          DRY_RUN: ${{ steps.cfg.outputs.dry_run }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config advice.detachedHead false
+
+          # 1) 备份需要保留的文件（放到工作区外，避免被 add 进仓库）
+          BACKUP_DIR="$(mktemp -d)"
+          for p in $PRESERVE_PATHS; do
+            if [ -e "$p" ] || [ -d "$p" ]; then
+              mkdir -p "${BACKUP_DIR}/$(dirname "$p")"
+              cp -a "$p" "${BACKUP_DIR}/$p"
+              echo "备份：${p}"
+            fi
+          done
+
+          # 2) 拉取上游（含全部 Tags；--force 保证被移动的 Tag 也能更新）
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --prune --tags --force upstream
+
+          if ! git rev-parse --verify "refs/remotes/upstream/${BRANCH}" > /dev/null 2>&1; then
+            echo "::error::上游 ${UPSTREAM_REPO} 不存在分支 ${BRANCH}，可用 MIRROR_BRANCH 指定"
+            exit 1
+          fi
+
+          # 3) 整体对齐到上游
+          git checkout -B "$BRANCH" "refs/remotes/upstream/${BRANCH}"
+
+          # 4) 还原保留文件，作为一次独立提交
+          #    用上游最新提交的时间做作者/提交时间，保证「内容相同 -> SHA 相同」，
+          #    这样反复运行不会因时间戳不同而每次都强推一次
+          if [ -n "$(ls -A "$BACKUP_DIR" 2>/dev/null || true)" ]; then
+            cp -a "${BACKUP_DIR}/." .
+            git add -A
+            if ! git diff --cached --quiet; then
+              STAMP=$(git log -1 --format=%aI)
+              GIT_AUTHOR_DATE="$STAMP" GIT_COMMITTER_DATE="$STAMP" \
+                git commit -m "chore(mirror): 保留本仓库自定义文件"
+              echo "已恢复保留文件"
+            fi
+          fi
+          rm -rf "$BACKUP_DIR"
+
+          # 5) 判断是否需要推送（内容一致就不推，避免无意义的 force push）
+          LOCAL_SHA=$(git rev-parse HEAD)
+          REMOTE_SHA=$(git ls-remote origin "refs/heads/${BRANCH}" 2>/dev/null | cut -f1 || true)
+          echo "local=${LOCAL_SHA}"
+          echo "remote=${REMOTE_SHA:-<空>}"
+
+          PUSHED=false
+          if [ "$LOCAL_SHA" = "${REMOTE_SHA:-}" ] && [ "$FORCE" != "true" ]; then
+            echo "分支 ${BRANCH} 已与上游一致，跳过推送"
+          elif [ "$DRY_RUN" = "true" ]; then
+            echo "演练模式：跳过推送"
+          else
+            for i in 1 2 3; do
+              if git push --force origin "HEAD:refs/heads/${BRANCH}"; then PUSHED=true; break; fi
+              echo "推送失败（第 ${i} 次），5 秒后重试…"
+              sleep 5
+            done
+            if [ "$PUSHED" != "true" ]; then
+              echo "::error::推送分支 ${BRANCH} 失败"
+              exit 1
+            fi
+            echo "分支 ${BRANCH} 已同步"
+          fi
+
+          # 6) 同步 Tags
+          if [ "$SYNC_TAGS" = "true" ] && [ "$DRY_RUN" != "true" ]; then
+            git push --force --tags origin || echo "::warning::部分 Tag 推送失败"
+            echo "Tags 同步完成（本地共 $(git tag | wc -l) 个）"
+
+            # 可选：删除本仓库里上游已不存在的 Tag
+            if [ "$PRUNE_TAGS" = "true" ]; then
+              git ls-remote --tags origin 2>/dev/null | awk '{print $2}' \
+                | sed -e 's#^refs/tags/##' -e 's#\^{}$##' | sort -u > /tmp/origin-tags.txt
+              git tag | sort -u > /tmp/local-tags.txt
+              comm -23 /tmp/origin-tags.txt /tmp/local-tags.txt > /tmp/stale-tags.txt || true
+              if [ -s /tmp/stale-tags.txt ]; then
+                echo "删除 $(wc -l < /tmp/stale-tags.txt) 个上游已不存在的 Tag"
+                xargs -r -n 20 git push origin --delete < /tmp/stale-tags.txt || true
+              fi
+            fi
+          fi
+
+          # 用完即删，避免后续 gh 把 upstream 当默认仓库
+          git remote remove upstream 2>/dev/null || true
+
+          echo "pushed=${PUSHED}" >> "$GITHUB_OUTPUT"
+
+      # -------------------------------------------------------------- 同步 Releases
+      - name: 同步 Releases
+        if: steps.cfg.outputs.run == 'true' && steps.cfg.outputs.sync_releases == 'true'
+        env:
+          UPSTREAM_REPO: ${{ steps.cfg.outputs.upstream }}
+          TARGET_REPO: ${{ github.repository }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ steps.cfg.outputs.dry_run }}
+        run: |
+          set -uo pipefail
+
+          # 一次性拉取上游 & 本仓库的 Release 快照，避免逐个查询浪费 API 配额
+          gh api --paginate "repos/${UPSTREAM_REPO}/releases?per_page=100" > /tmp/upstream.json || {
+            echo "::error::读取上游 Release 失败"; exit 1;
+          }
+          gh api --paginate "repos/${TARGET_REPO}/releases?per_page=100" > /tmp/target.json || echo "[]" > /tmp/target.json
+
+          TOTAL=0; CHANGED=0; FAIL=0
+
+          while IFS= read -r it; do
+            TOTAL=$((TOTAL + 1))
+            TAG=$(jq -r '.tag_name' <<<"$it")
+            NAME=$(jq -r '.name // .tag_name' <<<"$it")
+            DRAFT=$(jq -r '.draft' <<<"$it")
+            PRE=$(jq -r '.prerelease' <<<"$it")
+            echo "===== 处理 ${TAG} ====="
+
+            jq -r '.body // ""' <<<"$it" > /tmp/body.md
+
+            OUR_ID=$(jq -r --arg t "$TAG" '.[] | select(.tag_name == $t) | .id' /tmp/target.json | head -n1)
+            OUR_BODY=$(jq -r --arg t "$TAG" '.[] | select(.tag_name == $t) | .body // ""' /tmp/target.json | head -n1)
+
+            # 找出需要下载/上传的附件：本仓库缺失，或大小不一致
+            NEED_ASSETS=()
+            while IFS=$'\t' read -r an asz; do
+              if [ -z "${an}" ]; then continue; fi
+              OUR_SZ=$(jq -r --arg t "$TAG" --arg n "$an" \
+                '.[] | select(.tag_name == $t) | .assets[] | select(.name == $n) | .size' \
+                /tmp/target.json | head -n1)
+              if [ "${OUR_SZ}" != "${asz}" ]; then NEED_ASSETS+=("$an"); fi
+            done < <(jq -r '.assets[]? | "\(.name)\t\(.size)"' <<<"$it")
+
+            if [ -n "$OUR_ID" ] && [ "$OUR_BODY" = "$(cat /tmp/body.md)" ] && [ ${#NEED_ASSETS[@]} -eq 0 ]; then
+              echo "已是最新，跳过"
+              continue
+            fi
+
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "演练模式：将创建/更新 ${TAG}，附件 ${#NEED_ASSETS[@]} 个"
+              continue
+            fi
+
+            if [ -n "$OUR_ID" ]; then
+              echo "本仓库已存在 ${TAG}，走更新分支"
+              EDIT_ARGS=( "$TAG" --repo "$TARGET_REPO" --title "$NAME" --notes-file /tmp/body.md )
+              if [ "$PRE" = "true" ]; then EDIT_ARGS+=( "--prerelease" ); else EDIT_ARGS+=( "--prerelease=false" ); fi
+              if ! gh release edit "${EDIT_ARGS[@]}"; then
+                echo "::warning::更新 Release ${TAG} 失败"; FAIL=$((FAIL + 1)); continue
+              fi
+            else
+              echo "本仓库不存在 ${TAG}，走创建分支"
+              CREATE_ARGS=( "$TAG" --repo "$TARGET_REPO" --verify-tag --title "$NAME" --notes-file /tmp/body.md )
+              if [ "$DRAFT" = "true" ]; then CREATE_ARGS+=( "--draft" ); fi
+              if [ "$PRE" = "true" ]; then CREATE_ARGS+=( "--prerelease" ); fi
+              if ! gh release create "${CREATE_ARGS[@]}"; then
+                echo "::warning::创建 Release ${TAG} 失败（Tag 是否已推送？）"; FAIL=$((FAIL + 1)); continue
+              fi
+            fi
+
+            # 只下载缺失/变更的附件，避免每次全量下载
+            if [ ${#NEED_ASSETS[@]} -gt 0 ]; then
+              rm -rf ./tmp-assets && mkdir -p ./tmp-assets
+              for an in "${NEED_ASSETS[@]}"; do
+                gh release download "$TAG" --repo "$UPSTREAM_REPO" --pattern "$an" --dir ./tmp-assets --clobber \
+                  || echo "::warning::下载附件失败 ${TAG}/${an}"
+              done
+              if compgen -G "./tmp-assets/*" > /dev/null; then
+                gh release upload "$TAG" --repo "$TARGET_REPO" ./tmp-assets/* --clobber \
+                  || { echo "::warning::上传附件失败 ${TAG}"; FAIL=$((FAIL + 1)); }
+              fi
+              rm -rf ./tmp-assets
+            fi
+
+            CHANGED=$((CHANGED + 1))
+          done < <(jq -c '.[]?' /tmp/upstream.json)
+
+          echo "===== 共 ${TOTAL} 个 Release，变更 ${CHANGED} 个，失败 ${FAIL} 个 ====="
+          {
+            echo "### Releases"
+            echo ""
+            echo "共 \`${TOTAL}\` 个，本次变更 \`${CHANGED}\` 个，失败 \`${FAIL}\` 个"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "===== 本仓库 Release 实际列表（${TARGET_REPO}）====="
+          gh api --paginate "repos/${TARGET_REPO}/releases?per_page=100" \
+            --jq '.[] | "\(.tag_name)\tdraft=\(.draft)\tpre=\(.prerelease)\t\(.html_url)"' || true
+
+          if [ "$FAIL" -gt 0 ]; then
+            echo "::error::有 ${FAIL} 个 Release 同步失败，请查看上方日志"
+            exit 1
+          fi
